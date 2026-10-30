@@ -1,5 +1,7 @@
-# Hello? 1.0.1
+# Hello? 1.0.2
 
-- Fix Compose build (`modifier` parameter)
-- Optional **direct peer** `host:port` unicast (no app server; works online only if the path is reachable)
-- LAN / hotspot multicast unchanged
+- **Voice path rewrite**: multicast + broadcast + unicast to discovered peer IPs
+- Discovery beacons include local IPv4 so peers can reach each other without relying only on multicast
+- Separate TX/RX sockets, Wi‑Fi + multicast locks, speakerphone / IN_COMMUNICATION mode
+- AudioRecord tries VOICE_COMMUNICATION → MIC → DEFAULT
+- **UI**: scrollable form, IME padding, PTT pinned above keyboard, smaller hold button

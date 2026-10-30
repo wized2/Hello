@@ -43,7 +43,7 @@ class HelloTalkService : Service() {
         } else {
             startForeground(NOTIF_ID, notif)
         }
-        audio = AudioEngine { buf, n ->
+        audio = AudioEngine(this) { buf, n ->
             lan?.sendPcm(buf, 0, n)
             direct?.sendPcm(buf, 0, n)
             if (bt?.isActive() == true) bt?.sendPcm(buf, n)
@@ -54,6 +54,10 @@ class HelloTalkService : Service() {
             room = { room },
             peers = peers,
             onPcmFromPeer = { pcm -> audio?.playPcm(pcm) },
+            onLog = { s ->
+                statusLine = s
+                notifyListeners()
+            },
         ).also { it.start() }
         direct = DirectTransport(room = { room }, onPcm = { pcm -> audio?.playPcm(pcm) }).also { it.start() }
         bt = BluetoothTransport(
