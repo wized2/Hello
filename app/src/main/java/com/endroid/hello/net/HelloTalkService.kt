@@ -25,6 +25,7 @@ class HelloTalkService : Service() {
     private val peers = PeerDirectory()
     private var lan: LanTransport? = null
     private var bt: BluetoothTransport? = null
+    private var direct: DirectTransport? = null
     private var audio: AudioEngine? = null
     private var displayName: String = "Me"
     private var room: String = "hello"
@@ -44,6 +45,7 @@ class HelloTalkService : Service() {
         }
         audio = AudioEngine { buf, n ->
             lan?.sendPcm(buf, 0, n)
+            direct?.sendPcm(buf, 0, n)
             if (bt?.isActive() == true) bt?.sendPcm(buf, n)
         }
         lan = LanTransport(
@@ -53,6 +55,7 @@ class HelloTalkService : Service() {
             peers = peers,
             onPcmFromPeer = { pcm -> audio?.playPcm(pcm) },
         ).also { it.start() }
+        direct = DirectTransport(room = { room }, onPcm = { pcm -> audio?.playPcm(pcm) }).also { it.start() }
         bt = BluetoothTransport(
             this,
             onPcm = { pcm -> audio?.playPcm(pcm) },
@@ -74,9 +77,11 @@ class HelloTalkService : Service() {
 
     override fun onDestroy() {
         lan?.stop()
+        direct?.stop()
         bt?.stop()
         audio?.release()
         lan = null
+        direct = null
         bt = null
         audio = null
         super.onDestroy()
@@ -89,9 +94,18 @@ class HelloTalkService : Service() {
 
     fun setTalking(on: Boolean) {
         lan?.setTalking(on)
+        direct?.setTalking(on)
         if (on) audio?.startCapture() else audio?.stopCapture()
         statusLine = if (on) "Transmitting…" else "Listening on LAN / hotspot"
         notifyListeners()
+    }
+
+    fun setDirectPeer(host: String?, port: Int) {
+        direct?.setPeer(host, port)
+        if (!host.isNullOrBlank()) {
+            statusLine = "Direct peer $host:$port"
+            notifyListeners()
+        }
     }
 
     fun startBluetoothHost() {

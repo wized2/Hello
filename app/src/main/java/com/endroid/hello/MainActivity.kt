@@ -138,6 +138,7 @@ fun HelloApp(serviceState: HelloTalkService?, requestStart: () -> Unit) {
     var peers by remember { mutableStateOf<List<Peer>>(emptyList()) }
     var status by remember { mutableStateOf("Idle") }
     var talking by remember { mutableStateOf(false) }
+    var directPeer by remember { mutableStateOf(prefs.getString("direct", "") ?: "") }
 
     DisposableEffect(serviceState) {
         val s = serviceState
@@ -193,9 +194,23 @@ fun HelloApp(serviceState: HelloTalkService?, requestStart: () -> Unit) {
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
+            OutlinedTextField(
+                value = directPeer,
+                onValueChange = {
+                    directPeer = it
+                    prefs.edit().putString("direct", it).apply()
+                    val parts = it.trim().split(":")
+                    val host = parts.getOrNull(0)
+                    val port = parts.getOrNull(1)?.toIntOrNull() ?: 51515
+                    serviceState?.setDirectPeer(host, port)
+                },
+                label = { Text("Optional direct peer host:port") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
             Text(status, style = MaterialTheme.typography.labelLarge)
-            Card(Modifier = Modifier.fillMaxWidth()) {
-                Column(Modifier = Modifier.padding(12.dp)) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(12.dp)) {
                     Text("Nearby on this room", fontWeight = FontWeight.Medium)
                     if (peers.isEmpty()) {
                         Text(
@@ -204,7 +219,7 @@ fun HelloApp(serviceState: HelloTalkService?, requestStart: () -> Unit) {
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     } else {
-                        LazyColumn(Modifier = Modifier.height(120.dp)) {
+                        LazyColumn(modifier = Modifier.height(120.dp)) {
                             items(peers, key = { it.id }) { p ->
                                 Text("• ${p.name}")
                             }
@@ -212,7 +227,7 @@ fun HelloApp(serviceState: HelloTalkService?, requestStart: () -> Unit) {
                     }
                 }
             }
-            Spacer(Modifier = Modifier.weight(1f))
+            Spacer(modifier = Modifier.weight(1f))
             Box(
                 modifier = Modifier
                     .size(160.dp)
@@ -252,7 +267,7 @@ fun HelloApp(serviceState: HelloTalkService?, requestStart: () -> Unit) {
                     )
                 }
             }
-            Spacer(Modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(8.dp))
             TextButton(
                 onClick = { serviceState?.startBluetoothHost() },
                 modifier = Modifier.align(Alignment.CenterHorizontally),

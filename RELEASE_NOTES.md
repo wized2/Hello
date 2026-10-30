@@ -1,9 +1,5 @@
-# Hello? 1.0.0
+# Hello? 1.0.1
 
-First release.
-
-- LAN / hotspot push-to-talk (UDP multicast)
-- Room codes to separate groups on one network
-- Peer presence list
-- Optional Bluetooth host for 1:1
-- Material 3 UI, offline only
+- Fix Compose build (`modifier` parameter)
+- Optional **direct peer** `host:port` unicast (no app server; works online only if the path is reachable)
+- LAN / hotspot multicast unchanged
