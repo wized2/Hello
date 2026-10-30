@@ -1,0 +1,2 @@
+-keep class com.endroid.hello.** { *; }
+-dontwarn javax.annotation.**

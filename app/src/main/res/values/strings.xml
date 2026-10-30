@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Hello?</string>
+    <string name="service_channel">Hello? talk</string>
+    <string name="service_title">Hello? is listening</string>
+    <string name="service_text">Push-to-talk on local network</string>
+</resources>
