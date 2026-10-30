@@ -14,7 +14,7 @@ android {
         targetSdk = 35
         versionCode = 3
         versionName = "1.0.2"
-        buildConfigField("String", "VERSION_NAME", "\"1.0.1\"")
+        buildConfigField("String", "VERSION_NAME", "\"1.0.2\"")
     }
 
     signingConfigs {
