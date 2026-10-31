@@ -23,7 +23,7 @@ Everyone on the **same room code** and **same local network** hears the transmis
 
 | Link type | Supported | Notes |
 |-----------|-----------|--------|
-| Same Wi‑Fi | Yes | UDP multicast discovery + PCM audio |
+| Same Wi‑Fi | Yes | UDP broadcast + NSD discovery + unicast PCM audio |
 | Phone hotspot | Yes | Clients on the hotspot join the same room |
 | Bluetooth | Optional 1:1 | Host mode for a nearby peer when Wi‑Fi is down |
 | Internet / cellular | **No** | Needs a signaling or relay server — out of scope |

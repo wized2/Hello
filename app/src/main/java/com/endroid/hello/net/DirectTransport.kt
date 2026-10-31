@@ -34,7 +34,7 @@ class DirectTransport(
         if (!running.compareAndSet(false, true)) return
         thread(name = "hello-direct-rx", isDaemon = true) {
             try {
-                val sock = DatagramSocket(Protocol.AUDIO_PORT + 1)
+                val sock = DatagramSocket(Protocol.AUDIO_PORT)
                 sock.soTimeout = 1000
                 socket = sock
                 val buf = ByteArray(2048)

@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -21,7 +22,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -30,21 +30,23 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
@@ -65,25 +67,22 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import com.endroid.hello.net.HelloTalkService
 import com.endroid.hello.net.Peer
 
 class MainActivity : ComponentActivity() {
-    private var service: HelloTalkService? = null
     private var bound = false
     private val onService = mutableStateOf<HelloTalkService?>(null)
 
     private val conn = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-            val s = (binder as HelloTalkService.LocalBinder).getService()
-            service = s
             bound = true
-            onService.value = s
+            onService.value = (binder as HelloTalkService.LocalBinder).getService()
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             bound = false
-            service = null
             onService.value = null
         }
     }
@@ -97,6 +96,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        // Keep screen on while talking UI is open
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContent {
             val dark = isSystemInDarkTheme()
             MaterialTheme(colorScheme = if (dark) darkColorScheme() else lightColorScheme()) {
@@ -155,9 +157,9 @@ fun HelloApp(serviceState: HelloTalkService?, requestStart: () -> Unit) {
     var room by remember { mutableStateOf(prefs.getString("room", "hello") ?: "hello") }
     var directPeer by remember { mutableStateOf(prefs.getString("direct", "") ?: "") }
     var peers by remember { mutableStateOf<List<Peer>>(emptyList()) }
-    var status by remember { mutableStateOf("Idle") }
+    var status by remember { mutableStateOf("Starting…") }
     var talking by remember { mutableStateOf(false) }
-    val scroll = rememberScrollState()
+    var showSettings by remember { mutableStateOf(false) }
 
     DisposableEffect(serviceState) {
         val s = serviceState
@@ -165,10 +167,7 @@ fun HelloApp(serviceState: HelloTalkService?, requestStart: () -> Unit) {
             onDispose { }
         } else {
             s.configure(name.ifBlank { "Me" }, room)
-            val parts = directPeer.trim().split(":")
-            if (parts.isNotEmpty() && parts[0].isNotBlank()) {
-                s.setDirectPeer(parts[0], parts.getOrNull(1)?.toIntOrNull() ?: 51515)
-            }
+            applyDirect(s, directPeer)
             val listener: (List<Peer>, String) -> Unit = { p, st ->
                 peers = p
                 status = st
@@ -183,115 +182,129 @@ fun HelloApp(serviceState: HelloTalkService?, requestStart: () -> Unit) {
             .fillMaxSize()
             .statusBarsPadding()
             .navigationBarsPadding()
-            .imePadding()
-            .padding(horizontal = 16.dp),
+            .imePadding(),
     ) {
-        Text(
-            "Hello?",
-            style = MaterialTheme.typography.headlineSmall,
-            fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.padding(top = 12.dp, bottom = 4.dp),
-        )
-        Text(
-            "Same Wi‑Fi or hotspot · same room · hold to talk",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(bottom = 8.dp),
-        )
-
-        Column(
+        // Header
+        Row(
             Modifier
-                .weight(1f, fill = true)
-                .verticalScroll(scroll)
-                .fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            OutlinedTextField(
-                value = name,
-                onValueChange = {
-                    name = it
-                    prefs.edit().putString("name", it).apply()
-                    serviceState?.configure(it.ifBlank { "Me" }, room)
-                },
-                label = { Text("Your name") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = room,
-                onValueChange = {
-                    room = it
-                    prefs.edit().putString("room", it).apply()
-                    serviceState?.configure(name.ifBlank { "Me" }, it)
-                },
-                label = { Text("Room code") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = directPeer,
-                onValueChange = {
-                    directPeer = it
-                    prefs.edit().putString("direct", it).apply()
-                    val parts = it.trim().split(":")
-                    val host = parts.getOrNull(0)
-                    val port = parts.getOrNull(1)?.toIntOrNull() ?: 51515
-                    serviceState?.setDirectPeer(host, port)
-                },
-                label = { Text("Optional peer IP:port") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Text(
-                status,
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.primary,
-            )
+            Column(Modifier.weight(1f)) {
+                Text("Hello?", fontWeight = FontWeight.Bold, fontSize = 22.sp)
+                Text(
+                    status,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    maxLines = 2,
+                )
+            }
+            IconButton(onClick = { showSettings = !showSettings }) {
+                Icon(Icons.Default.Settings, contentDescription = "Settings")
+            }
+        }
+
+        // Settings (collapsed by default so PTT fits small screens)
+        if (showSettings) {
+            Column(
+                Modifier
+                    .weight(1f, fill = false)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = {
+                        name = it
+                        prefs.edit().putString("name", it).apply()
+                        serviceState?.configure(it.ifBlank { "Me" }, room)
+                    },
+                    label = { Text("Name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = room,
+                    onValueChange = {
+                        room = it
+                        prefs.edit().putString("room", it).apply()
+                        serviceState?.configure(name.ifBlank { "Me" }, it)
+                    },
+                    label = { Text("Room") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = directPeer,
+                    onValueChange = {
+                        directPeer = it
+                        prefs.edit().putString("direct", it).apply()
+                        serviceState?.let { s -> applyDirect(s, it) }
+                    },
+                    label = { Text("Peer IP (optional)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    "Both phones: same Wi‑Fi/hotspot + same room. Or type the other phone’s IP.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (serviceState == null) {
+                    Button(onClick = requestStart, modifier = Modifier.fillMaxWidth()) {
+                        Text("Start")
+                    }
+                }
+            }
+        } else {
+            // Peers fill middle when settings hidden
             Card(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp),
                 colors = CardDefaults.cardColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
                 ),
             ) {
-                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("Nearby", fontWeight = FontWeight.Medium)
+                Column(
+                    Modifier
+                        .fillMaxSize()
+                        .padding(12.dp)
+                        .verticalScroll(rememberScrollState()),
+                ) {
+                    Text(
+                        "Room “$room” · ${peers.size} nearby",
+                        fontWeight = FontWeight.Medium,
+                    )
+                    Spacer(Modifier.height(6.dp))
                     if (peers.isEmpty()) {
                         Text(
-                            "Waiting for other phones on this network…",
+                            "No peers yet.\n• Same Wi‑Fi or hotspot\n• Same room code\n• Open Hello? on the other phone\n• Or set Peer IP in settings ⚙",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     } else {
                         peers.forEach { p ->
-                            Text("• ${p.name}", style = MaterialTheme.typography.bodyMedium)
+                            Text("● ${p.name}", fontSize = 16.sp)
                         }
                     }
                 }
             }
-            TextButton(
-                onClick = { serviceState?.startBluetoothHost() },
-                modifier = Modifier.align(Alignment.CenterHorizontally),
-            ) {
-                Text("Bluetooth 1:1 host")
-            }
-            if (serviceState == null) {
-                Button(onClick = requestStart, modifier = Modifier.fillMaxWidth()) {
-                    Text("Grant mic & start")
-                }
-            }
-            Spacer(Modifier.height(8.dp))
         }
 
-        // PTT always visible above keyboard / nav
+        // PTT — always at bottom, above nav + keyboard
         Column(
             Modifier
                 .fillMaxWidth()
-                .padding(bottom = 12.dp, top = 4.dp),
+                .padding(vertical = 10.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Box(
                 modifier = Modifier
-                    .size(120.dp)
+                    .size(if (showSettings) 88.dp else 128.dp)
                     .clip(CircleShape)
                     .background(
                         if (talking) MaterialTheme.colorScheme.error
@@ -301,6 +314,7 @@ fun HelloApp(serviceState: HelloTalkService?, requestStart: () -> Unit) {
                         detectTapGestures(
                             onPress = {
                                 focus.clearFocus()
+                                showSettings = false
                                 serviceState?.setTalking(true)
                                 talking = true
                                 try {
@@ -319,23 +333,35 @@ fun HelloApp(serviceState: HelloTalkService?, requestStart: () -> Unit) {
                         Icons.Default.Mic,
                         contentDescription = "Hold to talk",
                         tint = Color.White,
-                        modifier = Modifier.size(40.dp),
+                        modifier = Modifier.size(if (showSettings) 32.dp else 44.dp),
                     )
                     Text(
-                        if (talking) "Talking…" else "Hold",
+                        if (talking) "ON AIR" else "HOLD",
                         color = Color.White,
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 14.sp,
-                        textAlign = TextAlign.Center,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
                     )
                 }
             }
             Text(
-                if (talking) "Release to stop" else "Hold the button while speaking",
-                style = MaterialTheme.typography.bodySmall,
+                if (talking) "Release to stop" else "Hold to talk",
+                style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
                 modifier = Modifier.padding(top = 6.dp),
             )
         }
     }
+}
+
+private fun applyDirect(s: HelloTalkService, raw: String) {
+    val t = raw.trim()
+    if (t.isEmpty()) {
+        s.setDirectPeer(null, 41235)
+        return
+    }
+    val parts = t.split(":")
+    val host = parts[0].trim()
+    val port = parts.getOrNull(1)?.toIntOrNull() ?: 41235
+    s.setDirectPeer(host, port)
 }

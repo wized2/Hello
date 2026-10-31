@@ -1,7 +1,7 @@
-# Hello? 1.0.2
+# Hello? 1.1.0
 
-- **Voice path rewrite**: multicast + broadcast + unicast to discovered peer IPs
-- Discovery beacons include local IPv4 so peers can reach each other without relying only on multicast
-- Separate TX/RX sockets, Wi‑Fi + multicast locks, speakerphone / IN_COMMUNICATION mode
-- AudioRecord tries VOICE_COMMUNICATION → MIC → DEFAULT
-- **UI**: scrollable form, IME padding, PTT pinned above keyboard, smaller hold button
+- **Discovery rewrite**: UDP broadcast every 1s (not multicast-only) + Android NSD
+- Peers exchange IPv4; **audio is unicast** to each peer (works on hotspot / picky routers)
+- UI: settings behind ⚙ so the hold button fits small screens; collapses when you talk
+- IME + navigation padding; keep screen on
+- Clear “no peers” hints

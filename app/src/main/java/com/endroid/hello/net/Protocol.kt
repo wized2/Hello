@@ -5,13 +5,12 @@ import java.nio.ByteOrder
 import java.security.MessageDigest
 
 object Protocol {
-    const val MAGIC = 0x48454C4F // "HELO"
+    const val MAGIC = 0x48454C4F // HELO
     const val SAMPLE_RATE = 16_000
-    const val AUDIO_GROUP = "239.255.42.99"
-    const val AUDIO_PORT = 51515
-    const val DISCOVERY_GROUP = "239.255.42.100"
-    const val DISCOVERY_PORT = 51516
+    const val DISCOVERY_PORT = 41234
+    const val AUDIO_PORT = 41235
     const val HEADER_SIZE = 12
+    const val NSD_SERVICE_TYPE = "_hello-ptt._udp."
 
     fun channelKey(room: String): Int {
         val md = MessageDigest.getInstance("SHA-256")
@@ -38,7 +37,6 @@ object Protocol {
         val seq = bb.short.toInt() and 0xFFFF
         val len = bb.short.toInt() and 0xFFFF
         if (HEADER_SIZE + len > length) return null
-        val pcm = buf.copyOfRange(HEADER_SIZE, HEADER_SIZE + len)
-        return Triple(key, seq, pcm)
+        return Triple(key, seq, buf.copyOfRange(HEADER_SIZE, HEADER_SIZE + len))
     }
 }

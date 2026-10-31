@@ -1,7 +1,10 @@
 package com.endroid.hello.net
 
 import android.content.Context
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.util.Log
 import org.json.JSONObject
 import java.net.DatagramPacket
@@ -9,7 +12,6 @@ import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
-import java.net.MulticastSocket
 import java.net.NetworkInterface
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -18,10 +20,10 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 /**
- * Robust LAN / hotspot PTT:
- * - Discovery beacons carry local IPv4 so peers can unicast
- * - Audio: multicast + subnet broadcast + unicast to known peers
- * - Separate RX/TX sockets (Android multicast TX is unreliable on one socket)
+ * Broadcast-first PTT (inspired by classic FOSS UDP walkie-talkies).
+ * Multicast is secondary — many OEM firmwares break IGMP.
+ * NSD (_hello-ptt._udp) helps discovery on Android.
+ * Audio is unicast to every live peer IP (+ broadcast fallback).
  */
 class LanTransport(
     private val context: Context,
@@ -35,13 +37,17 @@ class LanTransport(
     private val running = AtomicBoolean(false)
     private val talking = AtomicBoolean(false)
     private val seq = AtomicInteger(0)
-    private var mcastRx: MulticastSocket? = null
-    private var uniRx: DatagramSocket? = null
-    private var tx: DatagramSocket? = null
+    val selfId: String = UUID.randomUUID().toString()
+
+    private var discSocket: DatagramSocket? = null
+    private var audioSocket: DatagramSocket? = null
     private var multicastLock: WifiManager.MulticastLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
-    val selfId: String = UUID.randomUUID().toString()
-    private val peerAddrs = ConcurrentHashMap<String, InetSocketAddress>()
+
+    private val peerAudio = ConcurrentHashMap<String, InetSocketAddress>()
+    private var nsdManager: NsdManager? = null
+    private var nsdRegistration: NsdManager.RegistrationListener? = null
+    private var nsdDiscovery: NsdManager.DiscoveryListener? = null
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
@@ -51,231 +57,157 @@ class LanTransport(
                 setReferenceCounted(false)
                 acquire()
             }
-        } catch (e: Exception) {
-            Log.w(tag, "mcast lock", e)
-        }
+        } catch (_: Exception) {}
         try {
             @Suppress("DEPRECATION")
             wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "hello-wifi").apply {
                 setReferenceCounted(false)
                 acquire()
             }
-        } catch (e: Exception) {
-            Log.w(tag, "wifi lock", e)
-        }
-        thread(name = "hello-mcast-rx", isDaemon = true) { multicastRxLoop() }
-        thread(name = "hello-uni-rx", isDaemon = true) { unicastRxLoop() }
-        thread(name = "hello-disc-rx", isDaemon = true) { discoveryRxLoop() }
-        thread(name = "hello-disc-tx", isDaemon = true) { discoveryTxLoop() }
+        } catch (_: Exception) {}
+
         try {
-            tx = DatagramSocket().apply {
-                broadcast = true
+            discSocket = DatagramSocket(null).apply {
                 reuseAddress = true
+                broadcast = true
+                bind(InetSocketAddress(Protocol.DISCOVERY_PORT))
+                soTimeout = 1000
             }
         } catch (e: Exception) {
-            Log.e(tag, "tx socket", e)
-            onLog("TX socket failed")
+            Log.e(tag, "disc bind", e)
+            onLog("Discovery port busy: ${e.message}")
+            try {
+                discSocket = DatagramSocket().apply { broadcast = true; soTimeout = 1000 }
+            } catch (_: Exception) {}
         }
-        onLog("LAN started · ${localIpv4() ?: "no IPv4"}")
+
+        try {
+            audioSocket = DatagramSocket(null).apply {
+                reuseAddress = true
+                broadcast = true
+                bind(InetSocketAddress(Protocol.AUDIO_PORT))
+                soTimeout = 1000
+            }
+        } catch (e: Exception) {
+            Log.e(tag, "audio bind", e)
+            onLog("Audio port busy: ${e.message}")
+            try {
+                audioSocket = DatagramSocket().apply { broadcast = true; soTimeout = 1000 }
+            } catch (_: Exception) {}
+        }
+
+        thread(name = "hello-disc-rx", isDaemon = true) { discoveryRxLoop() }
+        thread(name = "hello-audio-rx", isDaemon = true) { audioRxLoop() }
+        thread(name = "hello-disc-tx", isDaemon = true) { discoveryTxLoop() }
+        startNsd()
+
+        val ip = localIpv4()
+        onLog("Ready · ${ip ?: "no IPv4"} · room ${room()}")
+        Log.i(tag, "started id=$selfId ip=$ip")
     }
 
     fun stop() {
         running.set(false)
         talking.set(false)
-        listOf(mcastRx, uniRx, tx).forEach { s ->
-            try { s?.close() } catch (_: Exception) {}
-        }
-        mcastRx = null
-        uniRx = null
-        tx = null
+        stopNsd()
+        try { discSocket?.close() } catch (_: Exception) {}
+        try { audioSocket?.close() } catch (_: Exception) {}
+        discSocket = null
+        audioSocket = null
         try { multicastLock?.release() } catch (_: Exception) {}
         try { wifiLock?.release() } catch (_: Exception) {}
-        multicastLock = null
-        wifiLock = null
-        peerAddrs.clear()
+        peerAudio.clear()
     }
 
     fun setTalking(on: Boolean) {
         talking.set(on)
     }
 
-    fun isTalking(): Boolean = talking.get()
-
     fun sendPcm(pcm: ByteArray, offset: Int, len: Int) {
         if (!running.get() || !talking.get()) return
-        val sock = tx ?: return
-        val key = Protocol.channelKey(room())
-        val packet = Protocol.packAudio(key, seq.incrementAndGet(), pcm, offset, len)
-        // 1) multicast
-        try {
-            val group = InetAddress.getByName(Protocol.AUDIO_GROUP)
-            sock.send(DatagramPacket(packet, packet.size, group, Protocol.AUDIO_PORT))
-        } catch (e: Exception) {
-            Log.w(tag, "mcast send", e)
+        val sock = audioSocket ?: return
+        val packet = Protocol.packAudio(
+            Protocol.channelKey(room()),
+            seq.incrementAndGet(),
+            pcm,
+            offset,
+            len,
+        )
+        // Unicast to each peer (primary — works on hotspot + most LANs)
+        val targets = peerAudio.values.toList()
+        if (targets.isEmpty()) {
+            // Still try broadcasts so a late peer might hear us
+            sendBytes(sock, packet, "255.255.255.255", Protocol.AUDIO_PORT)
+            localBroadcast()?.let { sendBytes(sock, packet, it.hostAddress, Protocol.AUDIO_PORT) }
+        } else {
+            for (addr in targets) {
+                try {
+                    sock.send(DatagramPacket(packet, packet.size, addr.address, addr.port))
+                } catch (e: Exception) {
+                    Log.w(tag, "uni send ${addr}", e)
+                }
+            }
+            // Plus one broadcast for devices that didn't register IP yet
+            sendBytes(sock, packet, "255.255.255.255", Protocol.AUDIO_PORT)
         }
-        // 2) limited broadcast
+    }
+
+    private fun sendBytes(sock: DatagramSocket, data: ByteArray, host: String?, port: Int) {
+        if (host.isNullOrBlank()) return
         try {
-            sock.send(
-                DatagramPacket(
-                    packet, packet.size,
-                    InetAddress.getByName("255.255.255.255"),
-                    Protocol.AUDIO_PORT,
-                ),
-            )
-        } catch (e: Exception) {
-            Log.w(tag, "bcast send", e)
-        }
-        // 3) subnet broadcast from local iface
-        localBroadcast()?.let { bcast ->
+            sock.send(DatagramPacket(data, data.size, InetAddress.getByName(host), port))
+        } catch (_: Exception) {}
+    }
+
+    private fun discoveryTxLoop() {
+        while (running.get()) {
             try {
-                sock.send(DatagramPacket(packet, packet.size, bcast, Protocol.AUDIO_PORT))
-            } catch (_: Exception) {}
-        }
-        // 4) unicast to discovered peers
-        for (addr in peerAddrs.values) {
+                val sock = discSocket ?: break
+                val body = JSONObject()
+                    .put("v", "1")
+                    .put("id", selfId)
+                    .put("name", selfName().ifBlank { "Me" })
+                    .put("room", room().trim().lowercase())
+                    .put("ip", localIpv4() ?: "")
+                    .put("aport", Protocol.AUDIO_PORT)
+                    .toString()
+                    .toByteArray(Charsets.UTF_8)
+
+                // Global broadcast
+                sendBytes(sock, body, "255.255.255.255", Protocol.DISCOVERY_PORT)
+                // Subnet broadcast
+                localBroadcast()?.hostAddress?.let {
+                    sendBytes(sock, body, it, Protocol.DISCOVERY_PORT)
+                }
+                // Unicast beacon to known peers (keeps NAT mappings warm on some APs)
+                for (addr in peerAudio.values) {
+                    try {
+                        sock.send(DatagramPacket(body, body.size, addr.address, Protocol.DISCOVERY_PORT))
+                    } catch (_: Exception) {}
+                }
+            } catch (e: Exception) {
+                Log.w(tag, "disc tx", e)
+            }
             try {
-                sock.send(DatagramPacket(packet, packet.size, addr.address, addr.port))
-            } catch (_: Exception) {}
-        }
-    }
-
-    private fun handleAudioPacket(data: ByteArray, length: Int) {
-        if (talking.get()) return
-        val unpacked = Protocol.unpackAudio(data, length) ?: return
-        if (unpacked.first != Protocol.channelKey(room())) return
-        onPcmFromPeer(unpacked.third)
-    }
-
-    private fun multicastRxLoop() {
-        try {
-            val sock = MulticastSocket(null)
-            sock.reuseAddress = true
-            sock.bind(InetSocketAddress(Protocol.AUDIO_PORT))
-            sock.soTimeout = 1500
-            val group = InetAddress.getByName(Protocol.AUDIO_GROUP)
-            var joined = false
-            preferredInterface()?.let { nif ->
-                try {
-                    sock.joinGroup(InetSocketAddress(group, Protocol.AUDIO_PORT), nif)
-                    joined = true
-                } catch (e: Exception) {
-                    Log.w(tag, "join nif", e)
-                }
+                Thread.sleep(1000)
+            } catch (_: InterruptedException) {
+                break
             }
-            if (!joined) {
-                @Suppress("DEPRECATION")
-                try {
-                    sock.joinGroup(group)
-                    joined = true
-                } catch (e: Exception) {
-                    Log.w(tag, "join legacy", e)
-                }
-            }
-            try { sock.timeToLive = 4 } catch (_: Exception) {}
-            mcastRx = sock
-            onLog(if (joined) "Multicast RX ok" else "Multicast join failed — using unicast")
-            val buf = ByteArray(4096)
-            while (running.get()) {
-                try {
-                    val dp = DatagramPacket(buf, buf.size)
-                    sock.receive(dp)
-                    handleAudioPacket(dp.data, dp.length)
-                } catch (_: java.net.SocketTimeoutException) {
-                } catch (e: Exception) {
-                    if (running.get()) Log.w(tag, "mcast rx", e)
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(tag, "mcastRxLoop", e)
-            onLog("Multicast RX error: ${e.message}")
-        }
-    }
-
-    private fun unicastRxLoop() {
-        try {
-            // Also bind AUDIO_PORT if mcast failed; else AUDIO_PORT+2 for dual path
-            val sock = try {
-                DatagramSocket(null).apply {
-                    reuseAddress = true
-                    bind(InetSocketAddress(Protocol.AUDIO_PORT))
-                }
-            } catch (_: Exception) {
-                DatagramSocket(Protocol.AUDIO_PORT + 2)
-            }
-            sock.soTimeout = 1500
-            sock.broadcast = true
-            uniRx = sock
-            val buf = ByteArray(4096)
-            while (running.get()) {
-                try {
-                    val dp = DatagramPacket(buf, buf.size)
-                    sock.receive(dp)
-                    handleAudioPacket(dp.data, dp.length)
-                } catch (_: java.net.SocketTimeoutException) {
-                } catch (e: Exception) {
-                    if (running.get()) Log.w(tag, "uni rx", e)
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(tag, "unicastRxLoop", e)
         }
     }
 
     private fun discoveryRxLoop() {
-        try {
-            val sock = MulticastSocket(null)
-            sock.reuseAddress = true
-            sock.bind(InetSocketAddress(Protocol.DISCOVERY_PORT))
-            sock.soTimeout = 1500
-            val group = InetAddress.getByName(Protocol.DISCOVERY_GROUP)
+        val buf = ByteArray(1024)
+        while (running.get()) {
+            val sock = discSocket ?: break
             try {
-                preferredInterface()?.let {
-                    sock.joinGroup(InetSocketAddress(group, Protocol.DISCOVERY_PORT), it)
-                } ?: run {
-                    @Suppress("DEPRECATION")
-                    sock.joinGroup(group)
-                }
-            } catch (_: Exception) {
-                try {
-                    @Suppress("DEPRECATION")
-                    sock.joinGroup(group)
-                } catch (_: Exception) {}
+                val dp = DatagramPacket(buf, buf.size)
+                sock.receive(dp)
+                handleDiscovery(String(dp.data, 0, dp.length, Charsets.UTF_8), dp.address)
+            } catch (_: java.net.SocketTimeoutException) {
+            } catch (e: Exception) {
+                if (running.get()) Log.w(tag, "disc rx", e)
             }
-            val discUni = try {
-                DatagramSocket(null).apply {
-                    reuseAddress = true
-                    bind(InetSocketAddress(Protocol.DISCOVERY_PORT))
-                    soTimeout = 1500
-                    broadcast = true
-                }
-            } catch (_: Exception) {
-                null
-            }
-            val buf = ByteArray(1024)
-            while (running.get()) {
-                // poll mcast
-                try {
-                    val dp = DatagramPacket(buf, buf.size)
-                    sock.receive(dp)
-                    handleDiscovery(String(dp.data, 0, dp.length, Charsets.UTF_8), dp.address)
-                } catch (_: java.net.SocketTimeoutException) {
-                } catch (e: Exception) {
-                    if (running.get()) Log.w(tag, "disc mcast", e)
-                }
-                // poll uni
-                if (discUni != null) {
-                    try {
-                        val dp = DatagramPacket(buf, buf.size)
-                        discUni.receive(dp)
-                        handleDiscovery(String(dp.data, 0, dp.length, Charsets.UTF_8), dp.address)
-                    } catch (_: java.net.SocketTimeoutException) {
-                    } catch (_: Exception) {}
-                }
-            }
-            try { sock.close() } catch (_: Exception) {}
-            try { discUni?.close() } catch (_: Exception) {}
-        } catch (e: Exception) {
-            Log.e(tag, "discoveryRxLoop", e)
         }
     }
 
@@ -283,76 +215,122 @@ class LanTransport(
         try {
             val json = JSONObject(text)
             if (json.optString("v") != "1") return
-            if (json.optString("room") != room().trim().lowercase()) return
+            val theirRoom = json.optString("room")
+            if (theirRoom != room().trim().lowercase()) return
             val id = json.optString("id")
             if (id.isBlank() || id == selfId) return
-            val name = json.optString("name")
+            val name = json.optString("name").ifBlank { id.take(6) }
             peers.touch(id, name)
-            val ip = json.optString("ip").ifBlank { from?.hostAddress }
-            val port = json.optInt("port", Protocol.AUDIO_PORT)
+            val ip = json.optString("ip").ifBlank {
+                from?.hostAddress?.substringBefore("%")
+            }
+            val port = json.optInt("aport", Protocol.AUDIO_PORT)
             if (!ip.isNullOrBlank() && !ip.contains(":")) {
-                try {
-                    peerAddrs[id] = InetSocketAddress(InetAddress.getByName(ip), port)
-                } catch (_: Exception) {}
+                peerAudio[id] = InetSocketAddress(InetAddress.getByName(ip), port)
+            } else if (from is Inet4Address) {
+                peerAudio[id] = InetSocketAddress(from, port)
             }
-        } catch (_: Exception) {}
+            Log.d(tag, "peer $name @ $ip")
+        } catch (e: Exception) {
+            Log.w(tag, "bad discovery", e)
+        }
     }
 
-    private fun discoveryTxLoop() {
-        val group = InetAddress.getByName(Protocol.DISCOVERY_GROUP)
+    private fun audioRxLoop() {
+        val buf = ByteArray(4096)
         while (running.get()) {
+            val sock = audioSocket ?: break
             try {
-                val sock = tx ?: DatagramSocket().also { it.broadcast = true }
-                val ip = localIpv4() ?: ""
-                val body = JSONObject()
-                    .put("v", "1")
-                    .put("id", selfId)
-                    .put("name", selfName())
-                    .put("room", room().trim().lowercase())
-                    .put("ip", ip)
-                    .put("port", Protocol.AUDIO_PORT)
-                    .toString()
-                    .toByteArray(Charsets.UTF_8)
-                sock.send(DatagramPacket(body, body.size, group, Protocol.DISCOVERY_PORT))
-                try {
-                    sock.send(
-                        DatagramPacket(
-                            body, body.size,
-                            InetAddress.getByName("255.255.255.255"),
-                            Protocol.DISCOVERY_PORT,
-                        ),
-                    )
-                } catch (_: Exception) {}
-                localBroadcast()?.let { b ->
-                    try {
-                        sock.send(DatagramPacket(body, body.size, b, Protocol.DISCOVERY_PORT))
-                    } catch (_: Exception) {}
-                }
+                val dp = DatagramPacket(buf, buf.size)
+                sock.receive(dp)
+                if (talking.get()) continue
+                val u = Protocol.unpackAudio(dp.data, dp.length) ?: continue
+                if (u.first != Protocol.channelKey(room())) continue
+                onPcmFromPeer(u.third)
+            } catch (_: java.net.SocketTimeoutException) {
             } catch (e: Exception) {
-                Log.w(tag, "discTx", e)
-            }
-            try {
-                Thread.sleep(1500)
-            } catch (_: InterruptedException) {
-                break
+                if (running.get()) Log.w(tag, "audio rx", e)
             }
         }
     }
 
-    private fun preferredInterface(): NetworkInterface? = try {
-        NetworkInterface.getNetworkInterfaces()?.toList()?.firstOrNull { ni ->
-            ni.isUp && !ni.isLoopback && ni.supportsMulticast() &&
-                ni.inetAddresses.toList().any { it is Inet4Address && !it.isLoopbackAddress }
+    private fun startNsd() {
+        try {
+            nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
+            val info = NsdServiceInfo().apply {
+                serviceName = "Hello-${selfId.take(8)}"
+                serviceType = Protocol.NSD_SERVICE_TYPE
+                port = Protocol.AUDIO_PORT
+                if (Build.VERSION.SDK_INT >= 34) {
+                    // attributes optional
+                }
+            }
+            val reg = object : NsdManager.RegistrationListener {
+                override fun onServiceRegistered(si: NsdServiceInfo) {
+                    Log.i(tag, "NSD registered ${si.serviceName}")
+                }
+                override fun onRegistrationFailed(si: NsdServiceInfo, code: Int) {
+                    Log.w(tag, "NSD reg fail $code")
+                }
+                override fun onServiceUnregistered(si: NsdServiceInfo) {}
+                override fun onUnregistrationFailed(si: NsdServiceInfo, code: Int) {}
+            }
+            nsdRegistration = reg
+            nsdManager?.registerService(info, NsdManager.PROTOCOL_DNS_SD, reg)
+
+            val disc = object : NsdManager.DiscoveryListener {
+                override fun onDiscoveryStarted(regType: String) {}
+                override fun onServiceFound(service: NsdServiceInfo) {
+                    if (service.serviceType != Protocol.NSD_SERVICE_TYPE &&
+                        !service.serviceType.contains("hello-ptt")
+                    ) return
+                    if (service.serviceName.contains(selfId.take(8))) return
+                    nsdManager?.resolveService(
+                        service,
+                        object : NsdManager.ResolveListener {
+                            override fun onResolveFailed(si: NsdServiceInfo, code: Int) {}
+                            override fun onServiceResolved(si: NsdServiceInfo) {
+                                val host = si.host?.hostAddress?.substringBefore("%") ?: return
+                                if (host.contains(":")) return
+                                val id = "nsd-$host"
+                                peers.touch(id, si.serviceName.removePrefix("Hello-"))
+                                peerAudio[id] = InetSocketAddress(
+                                    InetAddress.getByName(host),
+                                    if (si.port > 0) si.port else Protocol.AUDIO_PORT,
+                                )
+                                Log.i(tag, "NSD peer $host:${si.port}")
+                            }
+                        },
+                    )
+                }
+                override fun onServiceLost(service: NsdServiceInfo) {}
+                override fun onDiscoveryStopped(serviceType: String) {}
+                override fun onStartDiscoveryFailed(serviceType: String, code: Int) {
+                    Log.w(tag, "NSD start fail $code")
+                }
+                override fun onStopDiscoveryFailed(serviceType: String, code: Int) {}
+            }
+            nsdDiscovery = disc
+            nsdManager?.discoverServices(Protocol.NSD_SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, disc)
+        } catch (e: Exception) {
+            Log.w(tag, "NSD", e)
         }
-    } catch (_: Exception) {
-        null
+    }
+
+    private fun stopNsd() {
+        try {
+            nsdDiscovery?.let { nsdManager?.stopServiceDiscovery(it) }
+        } catch (_: Exception) {}
+        try {
+            nsdRegistration?.let { nsdManager?.unregisterService(it) }
+        } catch (_: Exception) {}
+        nsdDiscovery = null
+        nsdRegistration = null
+        nsdManager = null
     }
 
     private fun localIpv4(): String? {
         try {
-            preferredInterface()?.inetAddresses?.toList()?.forEach { a ->
-                if (a is Inet4Address && !a.isLoopbackAddress) return a.hostAddress
-            }
             NetworkInterface.getNetworkInterfaces()?.toList()?.forEach { ni ->
                 if (!ni.isUp || ni.isLoopback) return@forEach
                 ni.inetAddresses.toList().forEach { a ->
@@ -365,9 +343,11 @@ class LanTransport(
 
     private fun localBroadcast(): InetAddress? {
         try {
-            preferredInterface()?.interfaceAddresses?.forEach { ia ->
-                val b = ia.broadcast
-                if (b != null) return b
+            NetworkInterface.getNetworkInterfaces()?.toList()?.forEach { ni ->
+                if (!ni.isUp || ni.isLoopback) return@forEach
+                ni.interfaceAddresses.forEach { ia ->
+                    ia.broadcast?.let { return it }
+                }
             }
         } catch (_: Exception) {}
         return null
